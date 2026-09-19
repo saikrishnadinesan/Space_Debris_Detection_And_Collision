@@ -1,0 +1,22 @@
+# Environments
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets — never commit these
+.env
+
+# Data & models (large, regenerable — don't push to GitHub)
+data/raw/
+data/processed/
+data/synthetic/
+data/annotations/
+models/
+runs/
+outputs/
+*.pt
+*.onnx
+
+# OS/editor junk
+.DS_Store
+Thumbs.db

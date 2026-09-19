@@ -1,0 +1,87 @@
+# config.yaml — Central configuration for the Space Debris Pipeline
+
+# ─── Paths ───────────────────────────────────────────────
+paths:
+  raw_data: "data/raw"
+  processed_data: "data/processed"
+  synthetic_data: "data/synthetic"
+  annotations: "data/annotations"
+  detection_model: "models/detection"
+  tracking_model: "models/tracking"
+  prediction_model: "models/prediction"
+  outputs: "outputs"
+  logs: "logs"
+
+# ─── Data Collection ─────────────────────────────────────
+data:
+  celestrak_url: "https://celestrak.org/SOCRATES/query.php"
+  spacetrack_url: "https://www.space-track.org"
+  tle_sources:
+    - "https://celestrak.org/SOCRATES/query.php"
+    - "https://celestrak.org/pub/TLE/catalog.txt"
+  debris_categories:
+    - "DEBRIS"
+    - "ROCKET BODY"
+    - "UNKNOWN"
+  orbit_classes:
+    - "LEO"   # Low Earth Orbit (< 2000km)
+    - "MEO"   # Medium Earth Orbit (2000-35786km)
+    - "GEO"   # Geostationary Orbit (~35786km)
+    - "HEO"   # Highly Elliptical Orbit
+
+# ─── Preprocessing ───────────────────────────────────────
+preprocessing:
+  image_size: 640
+  train_split: 0.70
+  val_split: 0.15
+  test_split: 0.15
+  augmentation: true
+  normalize: true
+
+# ─── Detection Model (YOLOv8) ────────────────────────────
+detection:
+  model: "yolov8s.pt"       # small = best balance for 6GB VRAM
+  epochs: 100
+  batch_size: 8             # safe for 6GB VRAM
+  image_size: 640
+  learning_rate: 0.001
+  confidence_threshold: 0.5
+  iou_threshold: 0.45
+  classes:
+    0: "small_debris"       # < 10cm
+    1: "medium_debris"      # 10cm - 1m
+    2: "large_debris"       # > 1m
+    3: "rocket_body"
+    4: "defunct_satellite"
+
+# ─── Tracking (DeepSORT) ─────────────────────────────────
+tracking:
+  max_age: 30               # frames before track is deleted
+  min_hits: 3               # min detections before track confirmed
+  iou_threshold: 0.3
+  max_cosine_distance: 0.4
+
+# ─── Trajectory Prediction (LSTM) ────────────────────────
+prediction:
+  input_size: 6             # x, y, z, vx, vy, vz
+  hidden_size: 128
+  num_layers: 2
+  sequence_length: 20       # past timesteps
+  prediction_horizon: 10    # future timesteps to predict
+  batch_size: 32
+  epochs: 50
+  learning_rate: 0.001
+
+# ─── Collision Risk ───────────────────────────────────────
+collision:
+  risk_threshold_km: 1.0    # distance in km for high risk
+  warning_threshold_km: 5.0 # distance in km for warning
+  monte_carlo_samples: 1000
+
+# ─── Visualization ───────────────────────────────────────
+visualization:
+  dashboard_port: 8501
+  update_interval_seconds: 5
+  show_trajectories: true
+  show_risk_zones: true
+  3d_orbit_view: true
