@@ -21,10 +21,15 @@ os.makedirs(RAW_DATA_DIR, exist_ok=True)
 os.makedirs(PROCESSED_DIR, exist_ok=True)
 
 
+EARTH_RADIUS_KM = 6378.137
+EARTH_MU = 398600.4418  # Earth's gravitational parameter, km^3/s^2
+
 def compute_orbit_class(mean_motion: float) -> str:
     try:
-        period_min = 1440 / mean_motion
-        alt = ((6378.137 * (period_min / (2 * 3.14159)) ** (2/3)) - 6378.137)
+        period_min = 1440 / mean_motion          # revs/day -> minutes per orbit
+        period_sec = period_min * 60
+        semi_major_axis = (EARTH_MU * (period_sec / (2 * 3.14159)) ** 2) ** (1/3)
+        alt = semi_major_axis - EARTH_RADIUS_KM
         return "LEO" if alt < 2000 else ("MEO" if alt < 35786 else "GEO")
     except:
         return "LEO"
