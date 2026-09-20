@@ -58,7 +58,7 @@ print(f"   Response : {repr(resp.text[:200])}")
 # Step 3 — Test query
 print("\n🔍 Step 3: Testing authenticated query (ISS TLE)...")
 test = session.get(
-    f"{BASE_URL}/basicspacedata/query/class/gp/CATNR/25544/format/json/limit/1",
+    f"{BASE_URL}/basicspacedata/query/class/gp/NORAD_CAT_ID/25544/format/json/limit/1",
     timeout=30
 )
 print(f"   Status   : {test.status_code}")
