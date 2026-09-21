@@ -24,7 +24,7 @@ for d in [PROCESSED_DIR, SYNTHETIC_DIR, ANNOTATIONS_DIR]:
     os.makedirs(d, exist_ok=True)
 
 
-# ─── Step 1: Compute Positions from TLE ──────────────────────────────────────
+# --- Step 1: Compute Positions from TLE ---
 
 def tle_to_position(line1: str, line2: str, dt: datetime) -> tuple:
     """
@@ -40,7 +40,7 @@ def tle_to_position(line1: str, line2: str, dt: datetime) -> tuple:
     return None, None
 
 
-def generate_trajectory(line1: str, line2: str, hours: int = 24, step_minutes: int = 10) -> pd.DataFrame:
+def generate_trajectory(line1: str, line2: str, hours: int = 48, step_minutes: int = 15) -> pd.DataFrame:
     """Generate a time series of positions for a debris object."""
     records = []
     start_time = datetime.utcnow()
@@ -63,7 +63,7 @@ def generate_trajectory(line1: str, line2: str, hours: int = 24, step_minutes: i
 
 def process_catalog(catalog_path: str, max_objects: int = 500) -> pd.DataFrame:
     """Process TLE catalog into position trajectories."""
-    print("🔄 Processing TLE catalog into trajectories...")
+    print("Processing TLE catalog into trajectories...")
     df = pd.read_csv(catalog_path)
     df = df.head(max_objects)
 
@@ -71,7 +71,7 @@ def process_catalog(catalog_path: str, max_objects: int = 500) -> pd.DataFrame:
 
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Computing positions"):
         try:
-            traj = generate_trajectory(row["line1"], row["line2"], hours=2, step_minutes=30)
+            traj = generate_trajectory(row["line1"], row["line2"], hours=48, step_minutes=15)
             if not traj.empty:
                 traj["norad_id"] = row["norad_id"]
                 traj["name"] = row["name"]
@@ -84,27 +84,25 @@ def process_catalog(catalog_path: str, max_objects: int = 500) -> pd.DataFrame:
         result = pd.concat(all_trajectories, ignore_index=True)
         output = os.path.join(PROCESSED_DIR, "trajectories.csv")
         result.to_csv(output, index=False)
-        print(f"✅ Saved {len(result)} trajectory points to {output}")
+        print(f"Saved {len(result)} trajectory points to {output}")
         return result
 
     return pd.DataFrame()
 
 
-# ─── Step 2: Generate Synthetic Detection Images ─────────────────────────────
+# --- Step 2: Generate Synthetic Detection Images ---
 
 def generate_synthetic_image(num_debris: int = 5, image_size: int = 640) -> tuple:
     """
     Generate a synthetic space image with debris objects.
     Returns (image array, list of bounding boxes).
-    
+
     Classes:
     0 = small_debris, 1 = medium_debris, 2 = large_debris,
     3 = rocket_body, 4 = defunct_satellite
     """
-    # Dark space background with noise
     img = np.random.normal(5, 3, (image_size, image_size, 3)).clip(0, 30).astype(np.uint8)
 
-    # Add stars (random bright pixels)
     num_stars = np.random.randint(50, 200)
     for _ in range(num_stars):
         sx, sy = np.random.randint(0, image_size, 2)
@@ -114,30 +112,25 @@ def generate_synthetic_image(num_debris: int = 5, image_size: int = 640) -> tupl
     bboxes = []
 
     for _ in range(num_debris):
-        # Random debris class
         cls = np.random.randint(0, 5)
 
-        # Size based on class
         size_map = {0: (3, 8), 1: (8, 20), 2: (20, 40), 3: (25, 50), 4: (30, 60)}
         min_s, max_s = size_map[cls]
         w = np.random.randint(min_s, max_s)
         h = np.random.randint(min_s, max_s)
 
-        # Random position
         x = np.random.randint(w, image_size - w)
         y = np.random.randint(h, image_size - h)
 
-        # Draw debris object
         color_map = {
-            0: [180, 180, 200],   # small - grayish
-            1: [200, 200, 150],   # medium - yellowish
-            2: [220, 180, 180],   # large - reddish
-            3: [180, 220, 180],   # rocket body - greenish
-            4: [180, 180, 220],   # satellite - bluish
+            0: [180, 180, 200],
+            1: [200, 200, 150],
+            2: [220, 180, 180],
+            3: [180, 220, 180],
+            4: [180, 180, 220],
         }
         color = color_map[cls]
 
-        # Add glow effect
         for dy in range(-h//2, h//2):
             for dx in range(-w//2, w//2):
                 nx, ny = x + dx, y + dy
@@ -148,7 +141,6 @@ def generate_synthetic_image(num_debris: int = 5, image_size: int = 640) -> tupl
                         img[ny, nx] + np.array(color) * intensity, 0, 255
                     ).astype(np.uint8)
 
-        # YOLO format: class cx cy w h (normalized 0-1)
         cx = x / image_size
         cy = y / image_size
         nw = w / image_size
@@ -160,7 +152,7 @@ def generate_synthetic_image(num_debris: int = 5, image_size: int = 640) -> tupl
 
 def generate_synthetic_dataset(num_images: int = 1000, image_size: int = 640):
     """Generate a full synthetic dataset for YOLOv8 training."""
-    print(f"\n🎨 Generating {num_images} synthetic training images...")
+    print(f"\nGenerating {num_images} synthetic training images...")
 
     splits = {"train": int(0.7 * num_images),
               "val": int(0.15 * num_images),
@@ -176,17 +168,15 @@ def generate_synthetic_dataset(num_images: int = 1000, image_size: int = 640):
             num_obj = np.random.randint(1, 8)
             img, bboxes = generate_synthetic_image(num_obj, image_size)
 
-            # Save image
             img_path = os.path.join(img_dir, f"debris_{split}_{i:05d}.png")
             plt.imsave(img_path, img)
 
-            # Save YOLO labels
             lbl_path = os.path.join(lbl_dir, f"debris_{split}_{i:05d}.txt")
             with open(lbl_path, "w") as f:
                 for bbox in bboxes:
                     f.write(f"{bbox[0]} {bbox[1]:.6f} {bbox[2]:.6f} {bbox[3]:.6f} {bbox[4]:.6f}\n")
 
-    print(f"✅ Synthetic dataset saved to {SYNTHETIC_DIR}")
+    print(f"Synthetic dataset saved to {SYNTHETIC_DIR}")
     create_yolo_yaml()
 
 
@@ -209,27 +199,29 @@ names:
     yaml_path = os.path.join(SYNTHETIC_DIR, "debris.yaml")
     with open(yaml_path, "w") as f:
         f.write(yaml_content)
-    print(f"✅ YOLO config saved to {yaml_path}")
+    print(f"YOLO config saved to {yaml_path}")
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# --- Main ---
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("🛸 DATA PREPROCESSING PIPELINE")
+    print("SPACE DEBRIS - DATA PREPROCESSING PIPELINE")
     print("=" * 60)
 
     # Step 1: Process TLE catalog (if available)
     catalog_path = os.path.join(PROCESSED_DIR, "debris_catalog.csv")
     if os.path.exists(catalog_path):
         trajectories = process_catalog(catalog_path)
-        print(f"\n📍 Generated {len(trajectories)} trajectory points")
+        print(f"\nGenerated {len(trajectories)} trajectory points")
     else:
-        print("⚠️  No catalog found. Run collect_data.py first.")
-        print("   Skipping trajectory generation...")
+        print("No catalog found. Run collect_data.py first.")
+        print("Skipping trajectory generation...")
 
-    # Step 2: Generate synthetic training data
-    print("\n🎨 Generating synthetic training dataset...")
-    generate_synthetic_dataset(num_images=500, image_size=640)
+    # Step 2: Generate synthetic training data - DISABLED FOR PHASE 6
+    # We'll re-enable this in Phase 7, once the trajectory dataset
+    # (Phase 6) is generated and verified on its own.
+    # print("\nGenerating synthetic training dataset...")
+    # generate_synthetic_dataset(num_images=500, image_size=640)
 
-    print("\n✅ Preprocessing complete! Ready for model training.")
+    print("\nPreprocessing complete (Phase 6: trajectories only).")
