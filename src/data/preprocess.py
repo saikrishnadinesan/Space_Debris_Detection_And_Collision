@@ -221,7 +221,8 @@ if __name__ == "__main__":
     # Step 2: Generate synthetic training data - DISABLED FOR PHASE 6
     # We'll re-enable this in Phase 7, once the trajectory dataset
     # (Phase 6) is generated and verified on its own.
-    # print("\nGenerating synthetic training dataset...")
-    # generate_synthetic_dataset(num_images=500, image_size=640)
+       # Step 2: Generate synthetic training data
+    print("\nGenerating synthetic training dataset...")
+    generate_synthetic_dataset(num_images=500, image_size=640)
 
-    print("\nPreprocessing complete (Phase 6: trajectories only).")
+    print("\nPreprocessing complete (Phase 7: trajectories + synthetic images).")
