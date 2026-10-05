@@ -1,12 +1,13 @@
 """
-Real Pipeline — Full End-to-End Connection
+Real Pipeline - Full End-to-End Connection
 ============================================
 Connects:
-  1. TLE catalog (debris_catalog.csv) — real Space-Track data
-  2. SGP4 propagator — computes real XYZ positions right now
-  3. LSTM model — predicts future trajectories
-  4. Monte Carlo — computes real collision probabilities
-  5. Dashboard-ready DataFrame — feeds directly into visualization
+  1. TLE catalog (debris_catalog.csv) - real Space-Track data
+  2. SGP4 propagator - computes real XYZ positions right now
+  3. LSTM model - predicts future trajectories (using REAL SGP4-propagated
+     history, not a straight-line approximation)
+  4. Monte Carlo - computes real collision probabilities
+  5. Dashboard-ready DataFrame - feeds directly into visualization
 
 Usage:
   from src.pipeline.real_pipeline import run_full_pipeline
@@ -31,7 +32,7 @@ OUTPUTS_DIR      = os.path.join(ROOT, "outputs")
 os.makedirs(OUTPUTS_DIR, exist_ok=True)
 
 
-# ─── Step 1: Load TLE Catalog ─────────────────────────────────────────────────
+# --- Step 1: Load TLE Catalog ---
 
 def load_catalog(max_objects: int = 300) -> pd.DataFrame:
     """Load real TLE debris catalog downloaded from Space-Track."""
@@ -59,24 +60,24 @@ def load_catalog(max_objects: int = 300) -> pd.DataFrame:
         df_other.sample(n=n_other,   random_state=42) if n_other  > 0 else pd.DataFrame(),
     ], ignore_index=True)
 
-    print(f"   ✅ Loaded {len(df_sample)} objects from catalog")
+    print(f"   Loaded {len(df_sample)} objects from catalog")
     return df_sample
 
 
-# ─── Step 2: SGP4 Position Propagation ───────────────────────────────────────
+# --- Step 2: SGP4 Position Propagation ---
 
 def propagate_positions(df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute real XYZ positions for all debris objects RIGHT NOW
     using the SGP4 orbital mechanics propagator.
-    
+
     Returns DataFrame with columns: name, norad_id, x, y, z, vx, vy, vz,
-    altitude_km, orbit_class, lat, lon, speed_km_s
+    altitude_km, orbit_class, lat, lon, speed_km_s, line1, line2
     """
     try:
         from sgp4.api import Satrec, jday
     except ImportError:
-        print("   ❌ sgp4 not installed. Run: pip install sgp4")
+        print("   sgp4 not installed. Run: pip install sgp4")
         return pd.DataFrame()
 
     now = datetime.now(timezone.utc)
@@ -138,13 +139,15 @@ def propagate_positions(df: pd.DataFrame) -> pd.DataFrame:
                 "size_m":       round(size_m, 3),
                 "type":         classify_object_type(str(row["name"]), str(row.get("source",""))),
                 "epoch":        now.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "line1":        str(row["line1"]),
+                "line2":        str(row["line2"]),
             })
 
         except Exception:
             failed += 1
             continue
 
-    print(f"   ✅ Propagated {len(records)} positions ({failed} failed)")
+    print(f"   Propagated {len(records)} positions ({failed} failed)")
     return pd.DataFrame(records)
 
 
@@ -163,19 +166,26 @@ def classify_object_type(name: str, source: str) -> str:
     return "small_debris"
 
 
-# ─── Step 3: LSTM Trajectory Prediction ──────────────────────────────────────
+# --- Step 3: LSTM Trajectory Prediction ---
 
 def predict_trajectories(df_pos: pd.DataFrame, steps: int = 10) -> dict:
     """
     Use trained LSTM model to predict future positions for each object.
+
+    Builds each object's input history by PROPAGATING THE SAME TLE
+    BACKWARD IN TIME with SGP4 (20 real steps, 15 min apart - matching
+    exactly how trajectories.csv was generated in Phase 6), rather than
+    approximating history with a straight line from current velocity.
+
     Returns dict: {norad_id: predicted_path array (steps, 3)}
     """
     if not os.path.exists(LSTM_MODEL_PATH):
-        print("   ⚠️  LSTM model not found — using linear extrapolation")
+        print("   LSTM model not found - using linear extrapolation")
         return predict_linear(df_pos, steps)
 
     try:
         import joblib
+        from sgp4.api import Satrec, jday
 
         # Load model
         sys.path.insert(0, os.path.join(ROOT, "src"))
@@ -189,19 +199,28 @@ def predict_trajectories(df_pos: pd.DataFrame, steps: int = 10) -> dict:
 
         scaler = joblib.load(SCALER_PATH) if os.path.exists(SCALER_PATH) else None
 
+        now = datetime.now(timezone.utc)
+        dt_seconds = 900  # 15 min steps - MUST match Phase 6's step_minutes=15
+
         predictions = {}
         for _, row in df_pos.iterrows():
             try:
-                # Build a short history by slightly perturbing current state
-                # (simulating past positions along current velocity)
-                pos = np.array([row["x"], row["y"], row["z"]])
-                vel = np.array([row["vx"], row["vy"], row["vz"]])
-                dt  = 60  # seconds per step
+                # Build REAL history by propagating the same TLE backward
+                # in time with SGP4 - not a straight-line approximation
+                sat = Satrec.twoline2rv(row["line1"], row["line2"])
 
-                history = np.array([
-                    np.concatenate([pos - vel * dt * (20 - t), vel])
-                    for t in range(20)
-                ], dtype=np.float32)
+                history_rows = []
+                for t in range(20, 0, -1):
+                    past_time = now - pd.Timedelta(seconds=dt_seconds * t)
+                    jd, fr = jday(past_time.year, past_time.month, past_time.day,
+                                  past_time.hour, past_time.minute,
+                                  past_time.second + past_time.microsecond / 1e6)
+                    err, p, v = sat.sgp4(jd, fr)
+                    if err != 0:
+                        raise ValueError(f"SGP4 error {err} in history propagation")
+                    history_rows.append([p[0], p[1], p[2], v[0], v[1], v[2]])
+
+                history = np.array(history_rows, dtype=np.float32)
 
                 if scaler:
                     history = scaler.transform(history)
@@ -215,11 +234,11 @@ def predict_trajectories(df_pos: pd.DataFrame, steps: int = 10) -> dict:
             except Exception:
                 predictions[row["norad_id"]] = predict_linear_single(row, steps)
 
-        print(f"   ✅ LSTM predicted trajectories for {len(predictions)} objects")
+        print(f"   LSTM predicted trajectories for {len(predictions)} objects")
         return predictions
 
     except Exception as e:
-        print(f"   ⚠️  LSTM failed ({e}) — using linear extrapolation")
+        print(f"   LSTM failed ({e}) - using linear extrapolation")
         return predict_linear(df_pos, steps)
 
 
@@ -227,7 +246,7 @@ def predict_linear_single(row, steps: int = 10) -> np.ndarray:
     """Simple linear trajectory prediction as fallback."""
     pos = np.array([row["x"], row["y"], row["z"]])
     vel = np.array([row["vx"], row["vy"], row["vz"]])
-    dt  = 60  # seconds
+    dt  = 900  # seconds (15 min) - MUST match Phase 6's step_minutes=15
     return np.array([pos + vel * dt * t for t in range(1, steps + 1)])
 
 
@@ -237,16 +256,16 @@ def predict_linear(df_pos: pd.DataFrame, steps: int = 10) -> dict:
             for _, row in df_pos.iterrows()}
 
 
-# ─── Step 4: Collision Risk Assessment ───────────────────────────────────────
+# --- Step 4: Collision Risk Assessment ---
 
 def assess_collision_risks(df_pos: pd.DataFrame,
                             predictions: dict,
                             max_pairs: int = 5000) -> pd.DataFrame:
     """
     Run Monte Carlo collision risk for all close object pairs.
-    Only checks pairs within 50km of each other to keep it fast.
+    Only computes full risk for pairs within 500km of each other.
     """
-    print(f"   🔍 Checking collision risks...")
+    print(f"   Checking collision risks...")
 
     positions = df_pos[["norad_id","x","y","z","vx","vy","vz","size_m","name"]].values
     n         = len(positions)
@@ -290,7 +309,12 @@ def assess_collision_risks(df_pos: pd.DataFrame,
 
             samples    = 500
             collisions = 0
-            sigma      = max(0.1, min_dist * 0.1)  # uncertainty = 10% of miss distance
+            # Uncertainty grounded in the LSTM's actual measured prediction
+            # error (Phase 13: ~184 km mean error over a 10-step horizon),
+            # not a self-referential fraction of min_dist, which badly
+            # underestimates real uncertainty for small min_dist values.
+            LSTM_PREDICTION_ERROR_KM = 184.0
+            sigma = LSTM_PREDICTION_ERROR_KM
             for _ in range(samples):
                 dp1 = p1 + np.random.normal(0, sigma, 3)
                 dp2 = p2 + np.random.normal(0, sigma, 3)
@@ -326,11 +350,11 @@ def assess_collision_risks(df_pos: pd.DataFrame,
     if not df_risks.empty:
         df_risks = df_risks.sort_values("collision_probability", ascending=False)
 
-    print(f"   ✅ {len(df_risks)} conjunction events found ({pairs_checked} pairs checked)")
+    print(f"   {len(df_risks)} conjunction events found ({pairs_checked} pairs checked)")
     return df_risks
 
 
-# ─── Step 5: Assign Risk to Each Object ──────────────────────────────────────
+# --- Step 5: Assign Risk to Each Object ---
 
 def assign_object_risks(df_pos: pd.DataFrame, df_risks: pd.DataFrame) -> pd.DataFrame:
     """
@@ -351,7 +375,7 @@ def assign_object_risks(df_pos: pd.DataFrame, df_risks: pd.DataFrame) -> pd.Data
     return df_pos
 
 
-# ─── Step 6: Prepare Dashboard Data ──────────────────────────────────────────
+# --- Step 6: Prepare Dashboard Data ---
 
 def prepare_dashboard_data(df_pos: pd.DataFrame,
                             df_risks: pd.DataFrame) -> pd.DataFrame:
@@ -373,47 +397,47 @@ def prepare_dashboard_data(df_pos: pd.DataFrame,
     return df
 
 
-# ─── Main Pipeline ────────────────────────────────────────────────────────────
+# --- Main Pipeline ---
 
 def run_full_pipeline(max_objects: int = 300):
     """
     Run the complete real data pipeline.
-    
+
     Returns:
         df_pos   : DataFrame with real positions + risk levels
         df_risks : DataFrame with all conjunction events
     """
     print("\n" + "=" * 60)
-    print("🛸 REAL PIPELINE — FULL RUN")
+    print("REAL PIPELINE - FULL RUN")
     print(f"   Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print("=" * 60)
 
-    # Step 1 — Load catalog
-    print("\n📂 Step 1: Loading TLE catalog...")
+    # Step 1 - Load catalog
+    print("\nStep 1: Loading TLE catalog...")
     df_catalog = load_catalog(max_objects)
     if df_catalog.empty:
-        raise RuntimeError("Empty catalog — run Phase 1 first")
+        raise RuntimeError("Empty catalog - run Phase 1 first")
 
-    # Step 2 — Propagate positions
-    print("\n🌍 Step 2: Computing real positions via SGP4...")
+    # Step 2 - Propagate positions
+    print("\nStep 2: Computing real positions via SGP4...")
     df_pos = propagate_positions(df_catalog)
     if df_pos.empty:
         raise RuntimeError("No positions computed")
 
-    # Step 3 — LSTM trajectory prediction
-    print("\n🤖 Step 3: Predicting trajectories (LSTM)...")
+    # Step 3 - LSTM trajectory prediction
+    print("\nStep 3: Predicting trajectories (LSTM)...")
     predictions = predict_trajectories(df_pos, steps=10)
 
-    # Step 4 — Collision risk
-    print("\n⚠️  Step 4: Assessing collision risks...")
+    # Step 4 - Collision risk
+    print("\nStep 4: Assessing collision risks...")
     df_risks = assess_collision_risks(df_pos, predictions)
 
-    # Step 5 — Assign risk to objects
-    print("\n🎯 Step 5: Assigning risk levels...")
+    # Step 5 - Assign risk to objects
+    print("\nStep 5: Assigning risk levels...")
     df_pos = assign_object_risks(df_pos, df_risks)
 
-    # Step 6 — Save outputs
-    print("\n💾 Step 6: Saving outputs...")
+    # Step 6 - Save outputs
+    print("\nStep 6: Saving outputs...")
     df_pos.to_csv(os.path.join(OUTPUTS_DIR, "real_positions.csv"), index=False)
 
     # Always write a proper CSV with headers even if no conjunctions found
@@ -428,7 +452,7 @@ def run_full_pipeline(max_objects: int = 300):
 
     # Summary
     print("\n" + "=" * 60)
-    print("✅ PIPELINE COMPLETE")
+    print("PIPELINE COMPLETE")
     print(f"   Objects tracked  : {len(df_pos)}")
     print(f"   Conjunctions     : {len(df_risks)}")
     if not df_risks.empty:
@@ -442,7 +466,7 @@ def run_full_pipeline(max_objects: int = 300):
     return df_dashboard, df_risks
 
 
-# ─── Standalone runner ────────────────────────────────────────────────────────
+# --- Standalone runner ---
 
 if __name__ == "__main__":
     df, risks = run_full_pipeline(max_objects=300)
