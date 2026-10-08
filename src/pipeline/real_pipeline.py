@@ -1,477 +1,385 @@
 """
-Real Pipeline - Full End-to-End Connection
-============================================
-Connects:
-  1. TLE catalog (debris_catalog.csv) - real Space-Track data
-  2. SGP4 propagator - computes real XYZ positions right now
-  3. LSTM model - predicts future trajectories (using REAL SGP4-propagated
-     history, not a straight-line approximation)
-  4. Monte Carlo - computes real collision probabilities
-  5. Dashboard-ready DataFrame - feeds directly into visualization
+Phase 16: Full Pipeline Integration
+=====================================
+Connects all modules together:
+  SGP4 propagation -> LSTM trajectory prediction -> Monte Carlo collision risk -> dashboard data
 
-Usage:
-  from src.pipeline.real_pipeline import run_full_pipeline
-  df, risks = run_full_pipeline(max_objects=300)
+This is the "real" pipeline (uses real catalog + real trained models),
+as opposed to the individual test_*.py scripts which test one module at a time.
 """
 
 import os
 import sys
 import numpy as np
 import pandas as pd
-from datetime import datetime, timezone
 import torch
+import joblib
+from datetime import datetime, timezone
+from sgp4.api import Satrec, jday
 
-# Add project root to path
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, ROOT)
+# Make sure we can import sibling modules (src/models, src/data) regardless
+# of which directory this script is run from.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # .../src
+if ROOT not in sys.path:
+    sys.path.append(ROOT)
 
-CATALOG_PATH     = os.path.join(ROOT, "data", "processed", "debris_catalog.csv")
-LSTM_MODEL_PATH  = os.path.join(ROOT, "models", "prediction", "best_lstm.pt")
-SCALER_PATH      = os.path.join(ROOT, "models", "prediction", "scaler.pkl")
-OUTPUTS_DIR      = os.path.join(ROOT, "outputs")
+from models.train_prediction import DebrisLSTM
+from models.collision_risk import (
+    compute_miss_distance,
+    monte_carlo_collision_probability,
+    classify_risk,
+)
+
+# Rough "hard-body" size (meters) per object class, used by
+# monte_carlo_collision_probability() to compute a combined collision
+# radius. These line up with the detection classes trained in Phase 8.
+OBJECT_SIZE_M = {
+    "small_debris": 0.1,
+    "medium_debris": 0.5,
+    "large_debris": 2.0,
+    "rocket_body": 5.0,
+    "defunct_satellite": 3.0,
+    "debris": 0.5,      # generic fallback used by classify_object_type()
+    "unknown": 0.5,
+}
+
+# ─── Paths ──────────────────────────────────────────────────────────────────
+
+PROJECT_ROOT = os.path.dirname(ROOT)  # project root (one above src/)
+CATALOG_PATH = os.path.join(PROJECT_ROOT, "data", "processed", "debris_catalog.csv")
+LSTM_MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "prediction", "best_lstm.pt")
+SCALER_PATH = os.path.join(PROJECT_ROOT, "models", "prediction", "scaler.pkl")
+OUTPUTS_DIR = os.path.join(PROJECT_ROOT, "outputs")
 os.makedirs(OUTPUTS_DIR, exist_ok=True)
 
+# Grounded in Phase 13's measured real-world LSTM error (NORAD 51,
+# 10-step horizon, mean error 184.1 km). We use this as a FIXED
+# uncertainty (sigma) for Monte Carlo collision probability, instead of
+# deriving sigma from the very distance we are testing (that was the old,
+# self-referential bug).
+LSTM_PREDICTION_ERROR_KM = 184.0
 
-# --- Step 1: Load TLE Catalog ---
+# Must match Phase 6's step_minutes=15 (trajectories.csv sampling), since
+# the LSTM was trained on that spacing.
+STEP_SECONDS = 900
+SEQ_LEN = 20
+PRED_LEN = 10
+FEATURE_COLS = ["x", "y", "z", "vx", "vy", "vz"]
 
-def load_catalog(max_objects: int = 300) -> pd.DataFrame:
-    """Load real TLE debris catalog downloaded from Space-Track."""
-    if not os.path.exists(CATALOG_PATH):
-        raise FileNotFoundError(f"Catalog not found at {CATALOG_PATH}. Run Phase 1 first.")
 
+# ─── Step 1: Load catalog ───────────────────────────────────────────────────
+
+def load_catalog(max_objects: int = None) -> pd.DataFrame:
+    """Load the real debris catalog (TLE lines + metadata)."""
     df = pd.read_csv(CATALOG_PATH)
-
-    # Filter to objects with valid TLE lines
-    df = df[df["line1"].notna() & df["line2"].notna()]
-    df = df[df["line1"].str.startswith("1 ", na=False)]
-    df = df[df["line2"].str.startswith("2 ", na=False)]
-
-    # Prioritize debris objects
-    debris_mask = df["source"].isin(["debris", "rocket_bodies", "cosmos", "iridium"])
-    df_debris   = df[debris_mask]
-    df_other    = df[~debris_mask]
-
-    # Take up to max_objects, prioritizing real debris
-    n_debris = min(len(df_debris), int(max_objects * 0.7))
-    n_other  = min(len(df_other),  max_objects - n_debris)
-
-    df_sample = pd.concat([
-        df_debris.sample(n=n_debris, random_state=42) if n_debris > 0 else pd.DataFrame(),
-        df_other.sample(n=n_other,   random_state=42) if n_other  > 0 else pd.DataFrame(),
-    ], ignore_index=True)
-
-    print(f"   Loaded {len(df_sample)} objects from catalog")
-    return df_sample
+    if max_objects is not None:
+        df = df.head(max_objects).copy()
+    return df
 
 
-# --- Step 2: SGP4 Position Propagation ---
+# ─── Step 2: Propagate current positions with SGP4 ──────────────────────────
 
-def propagate_positions(df: pd.DataFrame) -> pd.DataFrame:
+def propagate_positions(df_catalog: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute real XYZ positions for all debris objects RIGHT NOW
-    using the SGP4 orbital mechanics propagator.
-
-    Returns DataFrame with columns: name, norad_id, x, y, z, vx, vy, vz,
-    altitude_km, orbit_class, lat, lon, speed_km_s, line1, line2
+    Use SGP4 to compute each object's CURRENT position/velocity from its TLE.
+    Keeps line1/line2 in the output so later steps (history propagation)
+    can re-propagate the same object without re-reading the catalog.
     """
-    try:
-        from sgp4.api import Satrec, jday
-    except ImportError:
-        print("   sgp4 not installed. Run: pip install sgp4")
-        return pd.DataFrame()
-
     now = datetime.now(timezone.utc)
     jd, fr = jday(now.year, now.month, now.day,
                   now.hour, now.minute, now.second + now.microsecond / 1e6)
 
     records = []
-    failed  = 0
-
-    for _, row in df.iterrows():
+    for _, row in df_catalog.iterrows():
         try:
-            sat = Satrec.twoline2rv(str(row["line1"]), str(row["line2"]))
-            err, pos, vel = sat.sgp4(jd, fr)
-
-            if err != 0 or not pos or len(pos) < 3:
-                failed += 1
+            sat = Satrec.twoline2rv(row["line1"], row["line2"])
+            err, p, v = sat.sgp4(jd, fr)
+            if err != 0:
                 continue
-
-            x, y, z    = pos
-            vx, vy, vz = vel
-
-            # Compute derived quantities
-            r          = np.sqrt(x**2 + y**2 + z**2)
-            altitude   = r - 6371.0
-            speed      = np.sqrt(vx**2 + vy**2 + vz**2)
-
-            # Skip objects with obviously wrong positions
-            if altitude < 100 or altitude > 100000:
-                failed += 1
-                continue
-
-            # Latitude and longitude from ECI
-            lat = np.degrees(np.arcsin(z / r))
-            lon = np.degrees(np.arctan2(y, x))
-
-            orbit_class = ("LEO" if altitude < 2000
-                           else "MEO" if altitude < 35786
-                           else "GEO")
-
-            # Debris size estimate from radar cross section (heuristic)
-            size_m = np.random.uniform(0.1, 5.0)  # will improve with real RCS data
-
             records.append({
-                "id":           str(row["norad_id"]),
-                "name":         str(row["name"]).strip(),
-                "norad_id":     int(row["norad_id"]),
-                "x":            round(x,  3),
-                "y":            round(y,  3),
-                "z":            round(z,  3),
-                "vx":           round(vx, 6),
-                "vy":           round(vy, 6),
-                "vz":           round(vz, 6),
-                "altitude_km":  round(altitude, 2),
-                "lat":          round(lat, 4),
-                "lon":          round(lon, 4),
-                "speed_km_s":   round(speed, 4),
-                "orbit_class":  orbit_class,
-                "source":       str(row.get("source", "real")),
-                "size_m":       round(size_m, 3),
-                "type":         classify_object_type(str(row["name"]), str(row.get("source",""))),
-                "epoch":        now.strftime("%Y-%m-%d %H:%M:%S UTC"),
-                "line1":        str(row["line1"]),
-                "line2":        str(row["line2"]),
+                "norad_id": row["norad_id"],
+                "x": p[0], "y": p[1], "z": p[2],
+                "vx": v[0], "vy": v[1], "vz": v[2],
+                "line1": str(row["line1"]),
+                "line2": str(row["line2"]),
+                "mean_motion": row.get("mean_motion", np.nan),
+                "object_type": row.get("object_type", "unknown"),
             })
-
         except Exception:
-            failed += 1
             continue
 
-    print(f"   Propagated {len(records)} positions ({failed} failed)")
     return pd.DataFrame(records)
 
 
-def classify_object_type(name: str, source: str) -> str:
-    """Classify debris object type from name and source."""
-    name_upper = name.upper()
-    if source == "rocket_bodies" or "R/B" in name_upper or "ROCKET" in name_upper:
-        return "rocket_body"
-    if "SAT" in name_upper or source == "active":
-        return "defunct_satellite"
-    if "DEB" in name_upper or source == "debris":
-        size_roll = np.random.random()
-        if size_roll < 0.5:   return "small_debris"
-        elif size_roll < 0.8: return "medium_debris"
-        else:                 return "large_debris"
-    return "small_debris"
+# ─── Step 3: Classify object type (size proxy for collision radius) ────────
+
+def classify_object_type(row: pd.Series) -> str:
+    """Fallback classifier if object_type is missing from the catalog."""
+    obj_type = row.get("object_type", None)
+    if isinstance(obj_type, str) and obj_type.lower() != "unknown":
+        return obj_type
+    return "debris"
 
 
-# --- Step 3: LSTM Trajectory Prediction ---
+# ─── Step 4: LSTM trajectory prediction (REAL SGP4 history, not fake) ──────
 
-def predict_trajectories(df_pos: pd.DataFrame, steps: int = 10) -> dict:
+def build_real_history(line1: str, line2: str, steps: int = SEQ_LEN,
+                        dt_seconds: int = STEP_SECONDS) -> np.ndarray:
     """
-    Use trained LSTM model to predict future positions for each object.
+    Build the past `steps` [x,y,z,vx,vy,vz] points for this object by
+    propagating the SAME TLE backward in time with SGP4 - this is the
+    object's real orbital history, not a straight-line guess.
 
-    Builds each object's input history by PROPAGATING THE SAME TLE
-    BACKWARD IN TIME with SGP4 (20 real steps, 15 min apart - matching
-    exactly how trajectories.csv was generated in Phase 6), rather than
-    approximating history with a straight line from current velocity.
-
-    Returns dict: {norad_id: predicted_path array (steps, 3)}
+    Returns array of shape (steps, 6), oldest point first, most recent
+    point last (so index [-1] is "now").
     """
-    if not os.path.exists(LSTM_MODEL_PATH):
-        print("   LSTM model not found - using linear extrapolation")
-        return predict_linear(df_pos, steps)
+    sat = Satrec.twoline2rv(line1, line2)
+    now = datetime.now(timezone.utc)
 
-    try:
-        import joblib
-        from sgp4.api import Satrec, jday
+    history_rows = []
+    for t in range(steps, 0, -1):
+        past_time = now - pd.Timedelta(seconds=dt_seconds * t)
+        jd, fr = jday(past_time.year, past_time.month, past_time.day,
+                      past_time.hour, past_time.minute,
+                      past_time.second + past_time.microsecond / 1e6)
+        err, p, v = sat.sgp4(jd, fr)
+        if err != 0:
+            raise ValueError(f"SGP4 error {err} in history propagation")
+        history_rows.append([p[0], p[1], p[2], v[0], v[1], v[2]])
 
-        # Load model
-        sys.path.insert(0, os.path.join(ROOT, "src"))
-        from models.train_prediction import DebrisLSTM
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model  = DebrisLSTM(input_size=6, hidden_size=128,
-                            num_layers=2, pred_len=steps, dropout=0.2)
-        model.load_state_dict(torch.load(LSTM_MODEL_PATH, map_location=device))
-        model.eval()
-
-        scaler = joblib.load(SCALER_PATH) if os.path.exists(SCALER_PATH) else None
-
-        now = datetime.now(timezone.utc)
-        dt_seconds = 900  # 15 min steps - MUST match Phase 6's step_minutes=15
-
-        predictions = {}
-        for _, row in df_pos.iterrows():
-            try:
-                # Build REAL history by propagating the same TLE backward
-                # in time with SGP4 - not a straight-line approximation
-                sat = Satrec.twoline2rv(row["line1"], row["line2"])
-
-                history_rows = []
-                for t in range(20, 0, -1):
-                    past_time = now - pd.Timedelta(seconds=dt_seconds * t)
-                    jd, fr = jday(past_time.year, past_time.month, past_time.day,
-                                  past_time.hour, past_time.minute,
-                                  past_time.second + past_time.microsecond / 1e6)
-                    err, p, v = sat.sgp4(jd, fr)
-                    if err != 0:
-                        raise ValueError(f"SGP4 error {err} in history propagation")
-                    history_rows.append([p[0], p[1], p[2], v[0], v[1], v[2]])
-
-                history = np.array(history_rows, dtype=np.float32)
-
-                if scaler:
-                    history = scaler.transform(history)
-
-                x_in = torch.tensor(history, dtype=torch.float32).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    pred = model(x_in).squeeze(0).cpu().numpy()
-
-                predictions[row["norad_id"]] = pred
-
-            except Exception:
-                predictions[row["norad_id"]] = predict_linear_single(row, steps)
-
-        print(f"   LSTM predicted trajectories for {len(predictions)} objects")
-        return predictions
-
-    except Exception as e:
-        print(f"   LSTM failed ({e}) - using linear extrapolation")
-        return predict_linear(df_pos, steps)
+    return np.array(history_rows, dtype=np.float32)
 
 
-def predict_linear_single(row, steps: int = 10) -> np.ndarray:
-    """Simple linear trajectory prediction as fallback."""
-    pos = np.array([row["x"], row["y"], row["z"]])
-    vel = np.array([row["vx"], row["vy"], row["vz"]])
-    dt  = 900  # seconds (15 min) - MUST match Phase 6's step_minutes=15
-    return np.array([pos + vel * dt * t for t in range(1, steps + 1)])
+def predict_trajectories(df_pos: pd.DataFrame, steps: int = PRED_LEN) -> dict:
+    """
+    For every object in df_pos, build its real SGP4 history (last 20
+    points) and feed it to the trained LSTM to predict the next `steps`
+    positions.
+
+    Returns: dict mapping norad_id -> predicted positions, shape (steps, 3),
+    in REAL KILOMETERS (already inverse-transformed back from the
+    scaler's normalized space).
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = DebrisLSTM(input_size=6, hidden_size=128, num_layers=2,
+                        pred_len=PRED_LEN, dropout=0.2)
+    model.load_state_dict(torch.load(LSTM_MODEL_PATH, map_location=device))
+    model.to(device)
+    model.eval()
+
+    scaler = joblib.load(SCALER_PATH) if os.path.exists(SCALER_PATH) else None
+
+    predictions = {}
+    for _, row in df_pos.iterrows():
+        try:
+            history = build_real_history(row["line1"], row["line2"],
+                                          steps=SEQ_LEN, dt_seconds=STEP_SECONDS)
+        except Exception:
+            continue
+
+        # Scale the input history the same way the training data was scaled.
+        if scaler:
+            history_scaled = scaler.transform(history)
+        else:
+            history_scaled = history
+
+        x = torch.tensor(history_scaled, dtype=torch.float32).unsqueeze(0).to(device)
+        with torch.no_grad():
+            pred = model(x).squeeze(0).cpu().numpy()  # shape (steps, 3), SCALED units
+
+        # CRITICAL: the model outputs SCALED (normalized) values, because
+        # it was trained on scaler.transform()-ed data (Phase 11/12).
+        # We must inverse-transform back to real km before using these
+        # values in real-world distance calculations - this step was
+        # previously MISSING, which caused every object's predicted path
+        # to collapse near [0,0,0] in scaled-space (since StandardScaler
+        # centers the data at mean=0), regardless of the object's true
+        # physical position. That bug produced the false "CRITICAL"
+        # collision alerts between unrelated, distant objects.
+        if scaler:
+            dummy = np.zeros((pred.shape[0], 6))
+            dummy[:, :3] = pred
+            pred = scaler.inverse_transform(dummy)[:, :3]
+
+        predictions[row["norad_id"]] = pred
+
+    return predictions
 
 
-def predict_linear(df_pos: pd.DataFrame, steps: int = 10) -> dict:
-    """Linear prediction fallback for all objects."""
-    return {row["norad_id"]: predict_linear_single(row, steps)
+# ─── Step 4b: Simple linear fallback (used only if LSTM/model unavailable) ──
+
+def predict_linear_single(row: pd.Series, steps: int = PRED_LEN,
+                           dt: int = STEP_SECONDS) -> np.ndarray:
+    """Straight-line extrapolation for ONE object, as a lightweight
+    fallback / sanity-check baseline (not used for the real risk numbers
+    unless the LSTM model/scaler files are missing)."""
+    pos = np.array([row["x"], row["y"], row["z"]], dtype=np.float64)
+    vel = np.array([row["vx"], row["vy"], row["vz"]], dtype=np.float64)
+    out = np.zeros((steps, 3))
+    for t in range(1, steps + 1):
+        out[t - 1] = pos + vel * dt * t
+    return out
+
+
+def predict_linear(df_pos: pd.DataFrame, steps: int = PRED_LEN) -> dict:
+    """Linear fallback for every object (dict norad_id -> (steps,3))."""
+    return {row["norad_id"]: predict_linear_single(row, steps=steps)
             for _, row in df_pos.iterrows()}
 
 
-# --- Step 4: Collision Risk Assessment ---
+# ─── Step 5: Monte Carlo collision risk assessment ──────────────────────────
 
-def assess_collision_risks(df_pos: pd.DataFrame,
-                            predictions: dict,
-                            max_pairs: int = 5000) -> pd.DataFrame:
+def assess_collision_risks(df_pos: pd.DataFrame, predictions: dict,
+                            n_samples: int = 1000) -> pd.DataFrame:
     """
-    Run Monte Carlo collision risk for all close object pairs.
-    Only computes full risk for pairs within 500km of each other.
+    For every pair of objects with predicted trajectories, find the
+    closest approach across the predicted horizon and run a Monte Carlo
+    simulation (using a FIXED uncertainty grounded in the Phase 13
+    measured LSTM error) to get a collision probability + risk
+    classification.
+
+    Matches the REAL collision_risk.py signatures:
+      compute_miss_distance(path1, path2) -> (min_dist, tca_step)
+      monte_carlo_collision_probability(pos1, pos2, vel1, vel2,
+                                         size1_m, size2_m,
+                                         uncertainty_km, samples) -> float
+      classify_risk(probability, min_distance_km) -> str  (prob FIRST)
     """
-    print(f"   Checking collision risks...")
+    norad_ids = list(predictions.keys())
+    pos_lookup = df_pos.set_index("norad_id")
+    results = []
 
-    positions = df_pos[["norad_id","x","y","z","vx","vy","vz","size_m","name"]].values
-    n         = len(positions)
-    risks     = []
-    pairs_checked = 0
+    for i in range(len(norad_ids)):
+        for j in range(i + 1, len(norad_ids)):
+            id_a, id_b = norad_ids[i], norad_ids[j]
+            traj_a, traj_b = predictions[id_a], predictions[id_b]
 
-    for i in range(n):
-        if pairs_checked >= max_pairs:
-            break
-        for j in range(i + 1, n):
-            if pairs_checked >= max_pairs:
-                break
+            n_steps = min(len(traj_a), len(traj_b))
+            min_dist, tca_step = compute_miss_distance(traj_a[:n_steps], traj_b[:n_steps])
 
-            p1 = positions[i, 1:4].astype(float)
-            p2 = positions[j, 1:4].astype(float)
-            dist = np.linalg.norm(p1 - p2)
-            pairs_checked += 1
-
-            # Only compute full risk for objects within 500km
-            if dist > 500:
+            # Only bother running Monte Carlo on pairs that are even
+            # remotely close - this keeps the full-catalog run fast.
+            if min_dist > 1000:  # km
                 continue
 
-            norad1 = int(positions[i, 0])
-            norad2 = int(positions[j, 0])
+            row_a = pos_lookup.loc[id_a]
+            row_b = pos_lookup.loc[id_b]
+            vel_a = np.array([row_a["vx"], row_a["vy"], row_a["vz"]])
+            vel_b = np.array([row_b["vx"], row_b["vy"], row_b["vz"]])
+            size_a = OBJECT_SIZE_M.get(row_a.get("object_type", "unknown"), 0.5)
+            size_b = OBJECT_SIZE_M.get(row_b.get("object_type", "unknown"), 0.5)
 
-            path1 = predictions.get(norad1)
-            path2 = predictions.get(norad2)
+            pos_a_tca = traj_a[tca_step]
+            pos_b_tca = traj_b[tca_step]
 
-            if path1 is None or path2 is None:
-                continue
+            # uncertainty_km is grounded in Phase 13's independently
+            # measured LSTM prediction error (184 km), NOT derived from
+            # min_dist itself. The old formula (sigma = max(0.1,
+            # min_dist * 0.1)) was self-referential/circular: it made the
+            # uncertainty shrink to near-zero exactly when two predicted
+            # paths happened to sit close together, which made Monte
+            # Carlo over-confident and produced false CRITICAL alerts.
+            prob = monte_carlo_collision_probability(
+                pos_a_tca, pos_b_tca, vel_a, vel_b, size_a, size_b,
+                uncertainty_km=LSTM_PREDICTION_ERROR_KM,
+                samples=n_samples,
+            )
+            risk = classify_risk(prob, min_dist)
 
-            # Minimum miss distance along predicted trajectories
-            dists  = np.linalg.norm(np.array(path1) - np.array(path2), axis=1)
-            min_dist = float(np.min(dists))
-            tca      = int(np.argmin(dists))
+            results.append({
+                "norad_id_a": id_a,
+                "norad_id_b": id_b,
+                "tca_step": int(tca_step),
+                "min_distance_km": min_dist,
+                "collision_probability": prob,
+                "risk_level": risk,
+            })
 
-            # Monte Carlo probability
-            size1 = float(positions[i, 7])
-            size2 = float(positions[j, 7])
-            combined_radius = (size1 + size2) / 2000  # km
-
-            samples    = 500
-            collisions = 0
-            # Uncertainty grounded in the LSTM's actual measured prediction
-            # error (Phase 13: ~184 km mean error over a 10-step horizon),
-            # not a self-referential fraction of min_dist, which badly
-            # underestimates real uncertainty for small min_dist values.
-            LSTM_PREDICTION_ERROR_KM = 184.0
-            sigma = LSTM_PREDICTION_ERROR_KM
-            for _ in range(samples):
-                dp1 = p1 + np.random.normal(0, sigma, 3)
-                dp2 = p2 + np.random.normal(0, sigma, 3)
-                if np.linalg.norm(dp1 - dp2) < combined_radius:
-                    collisions += 1
-
-            prob = collisions / samples
-
-            # Risk level
-            if prob > 0.01 or min_dist < 0.1:
-                risk = "CRITICAL"
-            elif prob > 0.001 or min_dist < 1.0:
-                risk = "HIGH"
-            elif prob > 0.0001 or min_dist < 5.0:
-                risk = "MEDIUM"
-            else:
-                risk = "LOW"
-
-            if risk in ("CRITICAL", "HIGH", "MEDIUM"):
-                risks.append({
-                    "obj1_id":   norad1,
-                    "obj1_name": str(positions[i, 8]),
-                    "obj2_id":   norad2,
-                    "obj2_name": str(positions[j, 8]),
-                    "current_distance_km": round(dist, 3),
-                    "min_distance_km":     round(min_dist, 3),
-                    "tca_step":            tca,
-                    "collision_probability": round(prob, 6),
-                    "risk_level":          risk,
-                })
-
-    df_risks = pd.DataFrame(risks)
-    if not df_risks.empty:
-        df_risks = df_risks.sort_values("collision_probability", ascending=False)
-
-    print(f"   {len(df_risks)} conjunction events found ({pairs_checked} pairs checked)")
-    return df_risks
+    return pd.DataFrame(results)
 
 
-# --- Step 5: Assign Risk to Each Object ---
+def assign_object_risks(df_pos: pd.DataFrame, risk_df: pd.DataFrame) -> pd.DataFrame:
+    """Attach each object's highest observed risk level (for dashboard coloring).
 
-def assign_object_risks(df_pos: pd.DataFrame, df_risks: pd.DataFrame) -> pd.DataFrame:
+    classify_risk() returns strings with an emoji baked in (e.g.
+    "CRITICAL 🔴"), so we rank by checking which level NAME is contained
+    in the string rather than an exact match.
     """
-    Assign worst risk level to each object based on conjunction results.
-    Objects not in any conjunction get LOW risk.
-    """
-    risk_priority = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
-    object_risks  = {}
+    risk_order = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+    highest = {}
 
-    if not df_risks.empty:
-        for _, row in df_risks.iterrows():
-            for obj_id in [row["obj1_id"], row["obj2_id"]]:
-                current = object_risks.get(obj_id, "LOW")
-                if risk_priority[row["risk_level"]] > risk_priority[current]:
-                    object_risks[obj_id] = row["risk_level"]
+    def rank(risk_level: str) -> int:
+        for idx, name in enumerate(risk_order):
+            if name in risk_level:
+                return idx
+        return 0
 
-    df_pos["risk_level"] = df_pos["norad_id"].map(object_risks).fillna("LOW")
+    for _, row in risk_df.iterrows():
+        for oid in (row["norad_id_a"], row["norad_id_b"]):
+            current = highest.get(oid, "LOW")
+            if rank(row["risk_level"]) > rank(current):
+                highest[oid] = row["risk_level"]
+
+    df_pos = df_pos.copy()
+    df_pos["risk_level"] = df_pos["norad_id"].map(lambda oid: highest.get(oid, "LOW"))
     return df_pos
 
 
-# --- Step 6: Prepare Dashboard Data ---
+# ─── Step 6: Prepare dashboard-ready output ─────────────────────────────────
 
-def prepare_dashboard_data(df_pos: pd.DataFrame,
-                            df_risks: pd.DataFrame) -> pd.DataFrame:
-    """Prepare final DataFrame for dashboard consumption."""
-    df = df_pos.copy()
-
-    # Ensure all required columns exist
-    required = ["id","name","x","y","z","altitude_km","orbit_class",
-                "type","risk_level","speed_km_s","size_m"]
-    for col in required:
-        if col not in df.columns:
-            df[col] = "unknown" if col in ["id","name","type","orbit_class","risk_level"] else 0.0
-
-    # Rename speed column for dashboard compatibility
-    if "speed_km_s" not in df.columns and "velocity_km_s" in df.columns:
-        df["speed_km_s"] = df["velocity_km_s"]
-
-    df["velocity_km_s"] = df["speed_km_s"]
-    return df
+def prepare_dashboard_data(df_pos: pd.DataFrame, risk_df: pd.DataFrame) -> dict:
+    """Bundle everything the Streamlit dashboard needs into one dict."""
+    n_critical = int(risk_df["risk_level"].str.contains("CRITICAL").sum()) if len(risk_df) else 0
+    return {
+        "positions": df_pos,
+        "conjunctions": risk_df,
+        "n_objects": len(df_pos),
+        "n_conjunctions": len(risk_df),
+        "n_critical": n_critical,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
-# --- Main Pipeline ---
+# ─── Full pipeline ───────────────────────────────────────────────────────────
 
 def run_full_pipeline(max_objects: int = 300):
-    """
-    Run the complete real data pipeline.
-
-    Returns:
-        df_pos   : DataFrame with real positions + risk levels
-        df_risks : DataFrame with all conjunction events
-    """
-    print("\n" + "=" * 60)
-    print("REAL PIPELINE - FULL RUN")
-    print(f"   Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print("=" * 60)
+    print("REAL PIPELINE: SGP4 -> LSTM -> Monte Carlo -> Dashboard")
     print("=" * 60)
 
-    # Step 1 - Load catalog
-    print("\nStep 1: Loading TLE catalog...")
-    df_catalog = load_catalog(max_objects)
-    if df_catalog.empty:
-        raise RuntimeError("Empty catalog - run Phase 1 first")
+    print(f"\n[1/5] Loading catalog (max {max_objects} objects)...")
+    df_catalog = load_catalog(max_objects=max_objects)
+    print(f"      Loaded {len(df_catalog)} objects")
 
-    # Step 2 - Propagate positions
-    print("\nStep 2: Computing real positions via SGP4...")
+    print("\n[2/5] Propagating current positions with SGP4...")
     df_pos = propagate_positions(df_catalog)
-    if df_pos.empty:
-        raise RuntimeError("No positions computed")
+    print(f"      Propagated {len(df_pos)} objects successfully")
 
-    # Step 3 - LSTM trajectory prediction
-    print("\nStep 3: Predicting trajectories (LSTM)...")
-    predictions = predict_trajectories(df_pos, steps=10)
+    print("\n[3/5] Predicting future trajectories with LSTM...")
+    predictions = predict_trajectories(df_pos, steps=PRED_LEN)
+    print(f"      Predicted trajectories for {len(predictions)} objects")
 
-    # Step 4 - Collision risk
-    print("\nStep 4: Assessing collision risks...")
-    df_risks = assess_collision_risks(df_pos, predictions)
+    print("\n[4/5] Assessing collision risks (Monte Carlo)...")
+    risk_df = assess_collision_risks(df_pos, predictions)
+    print(f"      Found {len(risk_df)} conjunction(s) within 1000km")
+    if len(risk_df):
+        print(risk_df.sort_values("min_distance_km").to_string(index=False))
 
-    # Step 5 - Assign risk to objects
-    print("\nStep 5: Assigning risk levels...")
-    df_pos = assign_object_risks(df_pos, df_risks)
+    print("\n[5/5] Preparing dashboard data...")
+    df_pos = assign_object_risks(df_pos, risk_df)
+    dashboard_data = prepare_dashboard_data(df_pos, risk_df)
 
-    # Step 6 - Save outputs
-    print("\nStep 6: Saving outputs...")
-    df_pos.to_csv(os.path.join(OUTPUTS_DIR, "real_positions.csv"), index=False)
+    out_path = os.path.join(OUTPUTS_DIR, "real_collision_risks.csv")
+    risk_df.to_csv(out_path, index=False)
+    print(f"\nSaved conjunction report to {out_path}")
 
-    # Always write a proper CSV with headers even if no conjunctions found
-    risk_columns = ["obj1_id","obj1_name","obj2_id","obj2_name",
-                    "current_distance_km","min_distance_km","tca_step",
-                    "collision_probability","risk_level"]
-    if df_risks.empty:
-        pd.DataFrame(columns=risk_columns).to_csv(
-            os.path.join(OUTPUTS_DIR, "real_collision_risks.csv"), index=False)
-    else:
-        df_risks.to_csv(os.path.join(OUTPUTS_DIR, "real_collision_risks.csv"), index=False)
+    pos_out_path = os.path.join(OUTPUTS_DIR, "real_positions.csv")
+    df_pos.to_csv(pos_out_path, index=False)
+    print(f"Saved object positions + risk levels to {pos_out_path}")
 
-    # Summary
-    print("\n" + "=" * 60)
-    print("PIPELINE COMPLETE")
-    print(f"   Objects tracked  : {len(df_pos)}")
-    print(f"   Conjunctions     : {len(df_risks)}")
-    if not df_risks.empty:
-        print(f"   Critical events  : {len(df_risks[df_risks['risk_level']=='CRITICAL'])}")
-        print(f"   High events      : {len(df_risks[df_risks['risk_level']=='HIGH'])}")
-    print(f"   Risk distribution:\n{df_pos['risk_level'].value_counts().to_string()}")
-    print("=" * 60)
+    return dashboard_data
 
-    # Prepare for dashboard
-    df_dashboard = prepare_dashboard_data(df_pos, df_risks)
-    return df_dashboard, df_risks
-
-
-# --- Standalone runner ---
 
 if __name__ == "__main__":
-    df, risks = run_full_pipeline(max_objects=300)
-    print("\nSample positions:")
-    print(df[["name","altitude_km","orbit_class","risk_level","speed_km_s"]].head(10).to_string(index=False))
-    if not risks.empty:
-        print("\nTop conjunction events:")
-        print(risks[["obj1_name","obj2_name","min_distance_km","collision_probability","risk_level"]].head(5).to_string(index=False))
+    run_full_pipeline(max_objects=300)
